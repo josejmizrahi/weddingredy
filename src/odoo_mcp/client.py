@@ -28,14 +28,15 @@ class OdooConfig:
     timeout: float = 30.0
 
     @classmethod
-    def from_env(cls) -> OdooConfig:
-        missing = [k for k in ("ODOO_URL", "ODOO_DB", "ODOO_API_KEY") if not os.environ.get(k)]
+    def from_env(cls, require_api_key: bool = True) -> OdooConfig:
+        required = ["ODOO_URL", "ODOO_DB"] + (["ODOO_API_KEY"] if require_api_key else [])
+        missing = [k for k in required if not os.environ.get(k)]
         if missing:
             raise OdooError(f"Faltan variables de entorno: {', '.join(missing)}")
         return cls(
             url=_base_url(os.environ["ODOO_URL"]),
             database=os.environ["ODOO_DB"],
-            api_key=os.environ["ODOO_API_KEY"],
+            api_key=os.environ.get("ODOO_API_KEY", ""),
             readonly=_env_flag("ODOO_READONLY"),
             allow_delete=_env_flag("ODOO_ALLOW_DELETE"),
             timeout=float(os.environ.get("ODOO_TIMEOUT", "30")),
@@ -56,18 +57,26 @@ def _base_url(url: str) -> str:
 
 
 class OdooClient:
-    def __init__(self, config: OdooConfig, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        config: OdooConfig,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        api_key: str | None = None,
+        http: httpx.AsyncClient | None = None,
+    ):
         self.config = config
-        self._http = httpx.AsyncClient(
+        self.api_key = config.api_key if api_key is None else api_key
+        self._http = http or httpx.AsyncClient(
             base_url=config.url,
             timeout=config.timeout,
             transport=transport,
-            headers={
-                "Authorization": f"bearer {config.api_key}",
-                "X-Odoo-Database": config.database,
-                "User-Agent": "odoo-mcp",
-            },
+            headers={"X-Odoo-Database": config.database, "User-Agent": "odoo-mcp"},
         )
+
+    def with_api_key(self, api_key: str) -> OdooClient:
+        """Otro cliente que usa la misma conexión HTTP pero actúa como el dueño de ``api_key``."""
+        return OdooClient(self.config, api_key=api_key, http=self._http)
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -77,7 +86,9 @@ class OdooClient:
         if ids is not None:
             body["ids"] = ids
         try:
-            resp = await self._http.post(f"/json/2/{model}/{method}", json=body)
+            resp = await self._http.post(
+                f"/json/2/{model}/{method}", json=body, headers={"Authorization": f"bearer {self.api_key}"}
+            )
         except httpx.HTTPError as exc:
             raise OdooError(f"No se pudo conectar con Odoo: {exc}") from exc
         if resp.is_success:

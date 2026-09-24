@@ -5,8 +5,13 @@ Servidor [MCP](https://modelcontextprotocol.io) que le da a Claude acceso a tu O
 XML-RPC/JSON-RPC (que Odoo va a retirar).
 
 ```
-Claude  ⇄  odoo-mcp (este proyecto, corre en tu compu)  ⇄  https://weddingready.odoo.com/json/2/...
+Claude  ⇄  odoo-mcp (este proyecto)  ⇄  https://weddingready.odoo.com/json/2/...
 ```
+
+Funciona de dos formas:
+
+- **Local** (Claude Desktop / Claude Code): corre en tu computadora con tu API key en la config.
+- **Remoto** (claude.ai web y móvil): publicado en internet, cada quien se conecta con su API key.
 
 Con esto le puedes pedir a Claude cosas como:
 
@@ -93,11 +98,44 @@ claude mcp add odoo \
   -- uv --directory /RUTA/A/weddingredy run odoo-mcp
 ```
 
-### claude.ai (web / móvil)
+### claude.ai (web, móvil y Desktop) — conector remoto
 
-claude.ai solo acepta conectores remotos (por HTTPS con autenticación). Este servidor corre
-localmente por stdio; para usarlo desde la web habría que desplegarlo en un servidor y
-agregarle OAuth. Es el siguiente paso posible.
+Para claude.ai el servidor tiene que estar publicado en internet (HTTPS). En ese modo **no
+guarda ninguna API key**: al conectar, Claude te abre una página donde pegas tu API key de Odoo;
+se valida contra Odoo y viaja cifrada dentro del token de Claude. Cada persona entra con sus
+propios permisos de Odoo.
+
+**1. Publicarlo en Render** (el repo ya trae `render.yaml` y `Dockerfile`):
+
+1. Crea una cuenta en [render.com](https://render.com) y conecta tu GitHub.
+2. **New → Blueprint** → elige el repo `weddingredy` (la rama donde esté este código).
+3. Render crea el servicio `odoo-mcp` con `ODOO_URL`, `ODOO_DB` y un `MCP_SECRET_KEY` aleatorio.
+   La URL pública la toma sola (`https://odoo-mcp-xxxx.onrender.com`).
+4. Cuando termine, abre `https://TU-SERVICIO.onrender.com/health`: debe decir `ok`.
+
+> El plan *free* de Render apaga el servicio tras 15 min sin uso y tarda ~1 min en despertar;
+> claude.ai puede fallar mientras tanto. Para uso diario conviene el plan *Starter*.
+> Cualquier otro host sirve (Railway, Fly.io, Cloud Run…) usando el `Dockerfile` y definiendo
+> `PUBLIC_URL` a mano.
+
+**2. Agregarlo en claude.ai:**
+
+1. claude.ai → **Configuración → Conectores → Agregar conector personalizado**.
+2. Nombre: `Odoo`. URL: `https://TU-SERVICIO.onrender.com/mcp`. Deja vacío lo de OAuth avanzado.
+3. **Conectar** → se abre la página "Conectar Odoo" → pega tu API key → **Conectar**.
+4. En un chat, activa el conector Odoo y pregunta: *"¿con qué usuario estás conectado a Odoo?"*.
+
+Variables del modo remoto:
+
+| Variable | Valor |
+|---|---|
+| `MCP_TRANSPORT` | `http` (ya viene en el Dockerfile) |
+| `PUBLIC_URL` | URL pública del servicio (en Render no hace falta) |
+| `MCP_SECRET_KEY` | cadena aleatoria de 32+ caracteres; si la cambias, hay que reconectar |
+| `MCP_ALLOWED_REDIRECT_HOSTS` | opcional, por defecto `claude.ai,claude.com,localhost,127.0.0.1` |
+| `ODOO_READONLY` / `ODOO_ALLOW_DELETE` | igual que en local |
+
+Para cortarle el acceso a Claude: borra la API key en Odoo (Seguridad de la cuenta).
 
 ## Probar sin Claude
 

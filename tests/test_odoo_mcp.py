@@ -101,7 +101,7 @@ async def test_call_method_passes_ids(use_client, calls):
 
 
 async def test_tools_are_registered():
-    names = {t.name for t in await server.mcp.list_tools()}
+    names = {t.name for t in await server.build_server().list_tools()}
     assert names == {
         "odoo_whoami", "odoo_list_models", "odoo_get_fields", "odoo_search_read",
         "odoo_count", "odoo_create", "odoo_update", "odoo_delete", "odoo_call_method",

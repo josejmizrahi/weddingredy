@@ -1,0 +1,14 @@
+# Blueprint de Render: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: odoo-mcp
+    runtime: docker
+    plan: starter  # el plan free se duerme y claude.ai puede fallar al conectar mientras despierta
+    healthCheckPath: /health
+    envVars:
+      - key: ODOO_URL
+        value: https://weddingready.odoo.com
+      - key: ODOO_DB
+        value: weddingready
+      - key: MCP_SECRET_KEY
+        generateValue: true

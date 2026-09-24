@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import argparse
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import os
 from typing import Annotated, Any
 
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
+from .auth import DEFAULT_REDIRECT_HOSTS, OdooAccessToken, OdooOAuthProvider
 from .client import OdooClient, OdooConfig, OdooError
 
 MAX_LIMIT = 500
@@ -26,21 +31,9 @@ Acceso a la instancia de Odoo de la empresa mediante su API.
 - Confirma con el usuario antes de crear, modificar o borrar registros.
 """
 
+# Cliente base. En modo local (stdio) usa ODOO_API_KEY; en modo remoto cada llamada usa la
+# API key de la persona conectada, que viaja cifrada dentro de su token OAuth.
 _client: OdooClient | None = None
-
-
-@asynccontextmanager
-async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
-    global _client
-    _client = OdooClient(OdooConfig.from_env())
-    try:
-        yield
-    finally:
-        await _client.aclose()
-        _client = None
-
-
-mcp = MCPServer("odoo", instructions=INSTRUCTIONS, lifespan=lifespan)
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
@@ -54,6 +47,11 @@ Ids = Annotated[list[int], Field(description="IDs de los registros", min_length=
 def client() -> OdooClient:
     if _client is None:
         raise ToolError("El cliente de Odoo no está inicializado")
+    token = get_access_token()
+    if isinstance(token, OdooAccessToken):
+        return _client.with_api_key(token.api_key)
+    if not _client.api_key:
+        raise ToolError("No hay API key de Odoo para esta sesión")
     return _client
 
 
@@ -70,7 +68,6 @@ async def run(coro: Any) -> Any:
         raise ToolError(str(exc)) from exc
 
 
-@mcp.tool(annotations=READ)
 async def odoo_whoami() -> dict:
     """Muestra con qué usuario, base de datos y URL está conectado el servidor, y si puede escribir."""
     c = client()
@@ -87,7 +84,6 @@ async def odoo_whoami() -> dict:
     }
 
 
-@mcp.tool(annotations=READ)
 async def odoo_list_models(
     search: Annotated[str, Field(description="Texto a buscar en el nombre técnico o la descripción")] = "",
     limit: int = 50,
@@ -99,7 +95,6 @@ async def odoo_list_models(
     return await run(client().search_read("ir.model", domain, ["model", "name"], limit=min(limit, MAX_LIMIT), order="model"))
 
 
-@mcp.tool(annotations=READ)
 async def odoo_get_fields(
     model: Model,
     search: Annotated[str, Field(description="Filtrar campos cuyo nombre o etiqueta contenga este texto")] = "",
@@ -112,7 +107,6 @@ async def odoo_get_fields(
     return fields
 
 
-@mcp.tool(annotations=READ)
 async def odoo_search_read(
     model: Model,
     domain: Domain = [],
@@ -130,13 +124,11 @@ async def odoo_search_read(
     return result
 
 
-@mcp.tool(annotations=READ)
 async def odoo_count(model: Model, domain: Domain = []) -> int:
     """Cuenta cuántos registros de un modelo cumplen el dominio."""
     return await run(client().search_count(model, domain))
 
 
-@mcp.tool(annotations=WRITE)
 async def odoo_create(
     model: Model,
     values: Annotated[dict, Field(description="Valores del nuevo registro, p. ej. {'name': 'Ana', 'email': 'ana@x.com'}")],
@@ -147,7 +139,6 @@ async def odoo_create(
     return {"id": new_id, "model": model}
 
 
-@mcp.tool(annotations=WRITE)
 async def odoo_update(
     model: Model,
     ids: Ids,
@@ -159,7 +150,6 @@ async def odoo_update(
     return {"updated": ids, "model": model}
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
 async def odoo_delete(model: Model, ids: Ids) -> dict:
     """Borra registros definitivamente. Solo disponible con ODOO_ALLOW_DELETE=true."""
     ensure_writable()
@@ -169,7 +159,6 @@ async def odoo_delete(model: Model, ids: Ids) -> dict:
     return {"deleted": ids, "model": model}
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
 async def odoo_call_method(
     model: Model,
     method: Annotated[str, Field(description="Método público del modelo, p. ej. 'action_confirm' en sale.order")],
@@ -185,8 +174,72 @@ async def odoo_call_method(
     return json.loads(json.dumps(result, default=str))
 
 
+TOOLS = [
+    (odoo_whoami, READ),
+    (odoo_list_models, READ),
+    (odoo_get_fields, READ),
+    (odoo_search_read, READ),
+    (odoo_count, READ),
+    (odoo_create, WRITE),
+    (odoo_update, WRITE),
+    (odoo_delete, DESTRUCTIVE),
+    (odoo_call_method, DESTRUCTIVE),
+]
+
+
+def build_server(provider: OdooOAuthProvider | None = None) -> MCPServer:
+    auth = None
+    if provider:
+        auth = AuthSettings(
+            issuer_url=provider.public_url,
+            resource_server_url=f"{provider.public_url}/mcp",
+            validate_token_resource=False,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+        )
+    server = MCPServer("odoo", instructions=INSTRUCTIONS, auth_server_provider=provider, auth=auth)
+    for fn, annotations in TOOLS:
+        server.add_tool(fn, annotations=annotations)
+
+    @server.custom_route("/health", methods=["GET"])
+    async def health(_request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    if provider:
+        server.custom_route("/login", methods=["GET", "POST"])(provider.login_page)
+    return server
+
+
 def main() -> None:
-    mcp.run()
+    global _client
+    parser = argparse.ArgumentParser(description="Servidor MCP para Odoo")
+    parser.add_argument("--http", action="store_true", default=os.environ.get("MCP_TRANSPORT") == "http",
+                        help="Servir por HTTPS con OAuth (para claude.ai) en vez de stdio")
+    args = parser.parse_args()
+
+    if not args.http:
+        _client = OdooClient(OdooConfig.from_env())
+        build_server().run()
+        return
+
+    # Render define RENDER_EXTERNAL_URL solo; en otros hosts hay que poner PUBLIC_URL.
+    public_url = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    missing = [k for k, v in (("PUBLIC_URL", public_url), ("MCP_SECRET_KEY", os.environ.get("MCP_SECRET_KEY"))) if not v]
+    if missing:
+        raise SystemExit(f"Faltan variables de entorno para el modo HTTP: {', '.join(missing)}")
+    _client = OdooClient(OdooConfig.from_env(require_api_key=False))
+    hosts = os.environ.get("MCP_ALLOWED_REDIRECT_HOSTS")
+    provider = OdooOAuthProvider(
+        _client,
+        secret=os.environ["MCP_SECRET_KEY"],
+        public_url=public_url,
+        allowed_redirect_hosts=tuple(h.strip() for h in hosts.split(",")) if hosts else DEFAULT_REDIRECT_HOSTS,
+    )
+    build_server(provider).run(
+        "streamable-http",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        stateless_http=True,
+    )
 
 
 if __name__ == "__main__":
